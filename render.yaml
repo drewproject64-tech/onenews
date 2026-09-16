@@ -1,0 +1,11 @@
+services:
+  - type: worker
+    name: onenews
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO
