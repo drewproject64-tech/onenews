@@ -5,7 +5,6 @@ import os
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from urllib.parse import quote
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -29,7 +28,7 @@ dp = Dispatcher()
 @dataclass(frozen=True)
 class Story:
     title: str
-    link: str
+    summary: str
     source: str
 
 FEEDS = {
@@ -93,7 +92,16 @@ async def fetch_feed(session: aiohttp.ClientSession, source: str, url: str) -> l
 
             title = re.sub(r"\s+", " ", html.unescape(title)).strip()
             if title and link.startswith(("http://", "https://")):
-                stories.append(Story(title=title, link=link, source=source))
+                summary = ""
+                for child in item:
+                    tag = child.tag.lower()
+                    if tag.endswith("description"):
+                        summary = re.sub(r"<[^>]+>", " ", html.unescape(child.text or ""))
+                        summary = re.sub(r"\s+", " ", summary).strip()
+                        break
+                if not summary:
+                    summary = "Read the latest update in this news section."
+                stories.append(Story(title=title, summary=summary[:500], source=source))
             if len(stories) >= 5:
                 break
 
@@ -134,15 +142,8 @@ def news_menu(category: str) -> InlineKeyboardMarkup:
     )
     return builder.as_markup()
 
-def story_menu(stories: list[Story], category: str) -> InlineKeyboardMarkup:
+def story_menu(category: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    for index, story in enumerate(stories):
-        builder.row(
-            InlineKeyboardButton(
-                text=f"{index + 1}. {story.title[:55]}",
-                url=story.link,
-            )
-        )
     builder.row(
         InlineKeyboardButton(text="🔄 Refresh", callback_data=f"news:{category}"),
         InlineKeyboardButton(text="🏠 Main Menu", callback_data="home"),
@@ -152,8 +153,10 @@ def story_menu(stories: list[Story], category: str) -> InlineKeyboardMarkup:
 def format_stories(category: str, stories: list[Story]) -> str:
     lines = [f"<b>{LABELS[category]}</b>", "", "Recent headlines:"]
     for index, story in enumerate(stories, start=1):
-        lines.append(f"<b>{index}.</b> {html.escape(story.title)}")
+        lines.append(f"<b>{index}. {html.escape(story.title)}</b>")
+        lines.append(html.escape(story.summary))
         lines.append(f"<i>Source: {html.escape(story.source)}</i>")
+        lines.append("")
     return "\n".join(lines)
 
 async def show_news(target: Message | CallbackQuery, category: str) -> None:
@@ -168,7 +171,7 @@ async def show_news(target: Message | CallbackQuery, category: str) -> None:
     stories = await get_stories(category)
     if stories:
         text = format_stories(category, stories)
-        markup = story_menu(stories, category)
+        markup = story_menu(category)
     else:
         text = (
             f"<b>{LABELS[category]}</b>\n\n"
