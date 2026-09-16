@@ -23,6 +23,9 @@ logger = logging.getLogger("onenews")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable is required")
+
 dp = Dispatcher()
 
 @dataclass(frozen=True)
@@ -55,16 +58,16 @@ LABELS = {
 WELCOME = (
     "<b>🇺🇸 Welcome to One American News</b>\n\n"
     "Browse current news in three simple sections. "
-    "Choose a section below to load recent headlines directly in Telegram."
+    "Choose a section below to read recent headlines and summaries directly in Telegram."
 )
 
 HELP = (
     "<b>Help</b>\n\n"
-    "Use the three buttons to browse recent headlines:\n"
+    "Use the three buttons to read recent news directly in Telegram:\n"
     "📰 Latest News — current top stories\n"
     "🇺🇸 U.S. News — recent U.S. stories\n"
     "🌎 World News — recent international stories\n\n"
-    "Tap a headline to open the original source, or use Main Menu to return."
+    "Use Refresh to request newer stories or Main Menu to return."
 )
 
 async def fetch_feed(session: aiohttp.ClientSession, source: str, url: str) -> list[Story]:
@@ -80,30 +83,37 @@ async def fetch_feed(session: aiohttp.ClientSession, source: str, url: str) -> l
     stories: list[Story] = []
 
     for item in root.iter():
-        if item.tag.lower().endswith("item"):
-            title = ""
-            link = ""
-            for child in item:
-                tag = child.tag.lower()
-                if tag.endswith("title") and not title:
-                    title = (child.text or "").strip()
-                elif tag.endswith("link") and not link:
-                    link = (child.text or "").strip()
+        if not item.tag.lower().endswith("item"):
+            continue
 
-            title = re.sub(r"\s+", " ", html.unescape(title)).strip()
-            if title and link.startswith(("http://", "https://")):
-                summary = ""
-                for child in item:
-                    tag = child.tag.lower()
-                    if tag.endswith("description"):
-                        summary = re.sub(r"<[^>]+>", " ", html.unescape(child.text or ""))
-                        summary = re.sub(r"\s+", " ", summary).strip()
-                        break
-                if not summary:
-                    summary = "Read the latest update in this news section."
-                stories.append(Story(title=title, summary=summary[:500], source=source))
-            if len(stories) >= 5:
-                break
+        title = ""
+        link = ""
+        summary = ""
+        for child in item:
+            tag = child.tag.lower()
+            value = (child.text or "").strip()
+            if tag.endswith("title") and not title:
+                title = value
+            elif tag.endswith("link") and not link:
+                link = value
+            elif tag.endswith("description") and not summary:
+                summary = value
+
+        title = re.sub(r"\s+", " ", html.unescape(title)).strip()
+        summary = re.sub(r"<[^>]+>", " ", html.unescape(summary)).strip()
+        summary = re.sub(r"\s+", " ", summary).strip()
+
+        # The URL is used only to validate that this is a real feed item.
+        # It is intentionally never exposed as a user-facing Telegram button.
+        if title and link.startswith(("http://", "https://")):
+            if not summary:
+                summary = "A recent update from this news source."
+            stories.append(
+                Story(title=title, summary=summary[:700], source=source)
+            )
+
+        if len(stories) >= 5:
+            break
 
     return stories
 
@@ -123,15 +133,9 @@ async def get_stories(category: str) -> list[Story]:
 
 def main_menu() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="📰 Latest News", callback_data="news:latest"),
-    )
-    builder.row(
-        InlineKeyboardButton(text="🇺🇸 U.S. News", callback_data="news:us"),
-    )
-    builder.row(
-        InlineKeyboardButton(text="🌎 World News", callback_data="news:world"),
-    )
+    builder.row(InlineKeyboardButton(text="📰 Latest News", callback_data="news:latest"))
+    builder.row(InlineKeyboardButton(text="🇺🇸 U.S. News", callback_data="news:us"))
+    builder.row(InlineKeyboardButton(text="🌎 World News", callback_data="news:world"))
     return builder.as_markup()
 
 def news_menu(category: str) -> InlineKeyboardMarkup:
@@ -142,16 +146,8 @@ def news_menu(category: str) -> InlineKeyboardMarkup:
     )
     return builder.as_markup()
 
-def story_menu(category: str) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="🔄 Refresh", callback_data=f"news:{category}"),
-        InlineKeyboardButton(text="🏠 Main Menu", callback_data="home"),
-    )
-    return builder.as_markup()
-
 def format_stories(category: str, stories: list[Story]) -> str:
-    lines = [f"<b>{LABELS[category]}</b>", "", "Recent headlines:"]
+    lines = [f"<b>{LABELS[category]}</b>", "", "Recent headlines:", ""]
     for index, story in enumerate(stories, start=1):
         lines.append(f"<b>{index}. {html.escape(story.title)}</b>")
         lines.append(html.escape(story.summary))
@@ -160,23 +156,18 @@ def format_stories(category: str, stories: list[Story]) -> str:
     return "\n".join(lines)
 
 async def show_news(target: Message | CallbackQuery, category: str) -> None:
-    if isinstance(target, CallbackQuery):
-        message = target.message
-    else:
-        message = target
-
+    message = target.message if isinstance(target, CallbackQuery) else target
     if message is None:
         return
 
     stories = await get_stories(category)
     if stories:
         text = format_stories(category, stories)
-        markup = story_menu(category)
+        markup = news_menu(category)
     else:
         text = (
             f"<b>{LABELS[category]}</b>\n\n"
-            "The news source is temporarily unavailable. "
-            "Please try again in a moment."
+            "The news feed is temporarily unavailable. Please try again."
         )
         markup = news_menu(category)
 
@@ -190,7 +181,7 @@ async def show_news(target: Message | CallbackQuery, category: str) -> None:
 
 @dp.message(CommandStart())
 async def start_handler(message: Message) -> None:
-    # Telegram Ads may append a start parameter; CommandStart safely accepts it.
+    # Works with /start and /start <campaign_parameter> without exposing it.
     await message.answer(WELCOME, reply_markup=main_menu())
 
 @dp.message(Command("help"))
@@ -226,16 +217,13 @@ async def on_startup(bot: Bot) -> None:
     logger.info("One American News started")
 
 async def main() -> None:
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable is required")
-
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     await bot.delete_webhook(drop_pending_updates=True)
-    await on_startup(bot)
     try:
+        await on_startup(bot)
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
