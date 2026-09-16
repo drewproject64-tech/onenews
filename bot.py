@@ -1,142 +1,241 @@
-import os
+import asyncio
+import html
 import logging
+import os
+import re
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from urllib.parse import quote
+
+import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, CommandStart
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("onenews")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable is required")
-
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-WELCOME = """<b>🇺🇸 Welcome to One American News</b>\n\nGet concise news summaries and general information about important stories from the United States and around the world.\n\n<b>What you can do here:</b>\n📰 Browse the latest news categories\n🇺🇸 Explore U.S. news topics\n🌎 Read world news summaries\nℹ️ Learn how the bot works\n\nSelect an option below to get started."""
+@dataclass(frozen=True)
+class Story:
+    title: str
+    link: str
+    source: str
 
-ABOUT = """<b>ℹ️ About One American News</b>\n\nOne American News is an informational Telegram bot designed to organize concise news summaries by topic.\n\nThe bot provides a simple way to browse U.S. and international news categories without unnecessary clutter.\n\n<i>News summaries are provided for general informational purposes.</i>"""
+FEEDS = {
+    "latest": (
+        ("BBC News", "https://feeds.bbci.co.uk/news/rss.xml"),
+        ("Al Jazeera", "https://www.aljazeera.com/xml/rss/all.xml"),
+    ),
+    "us": (
+        ("BBC U.S. & Canada", "https://feeds.bbci.co.uk/news/world/us_and_canada/rss.xml"),
+        ("Google News U.S.", "https://news.google.com/rss/search?q=United+States&hl=en-US&gl=US&ceid=US:en"),
+    ),
+    "world": (
+        ("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml"),
+        ("Al Jazeera", "https://www.aljazeera.com/xml/rss/all.xml"),
+    ),
+}
 
-CATEGORIES = """<b>📂 News Categories</b>\n\nChoose a category to view sample updates or connect the bot to your preferred news source later."""
+LABELS = {
+    "latest": "📰 Latest News",
+    "us": "🇺🇸 U.S. News",
+    "world": "🌎 World News",
+}
 
+WELCOME = (
+    "<b>🇺🇸 Welcome to One American News</b>\n\n"
+    "Browse current news in three simple sections. "
+    "Choose a section below to load recent headlines directly in Telegram."
+)
+
+HELP = (
+    "<b>Help</b>\n\n"
+    "Use the three buttons to browse recent headlines:\n"
+    "📰 Latest News — current top stories\n"
+    "🇺🇸 U.S. News — recent U.S. stories\n"
+    "🌎 World News — recent international stories\n\n"
+    "Tap a headline to open the original source, or use Main Menu to return."
+)
+
+async def fetch_feed(session: aiohttp.ClientSession, source: str, url: str) -> list[Story]:
+    async with session.get(
+        url,
+        timeout=aiohttp.ClientTimeout(total=8),
+        headers={"User-Agent": "OneAmericanNews/1.0"},
+    ) as response:
+        response.raise_for_status()
+        payload = await response.read()
+
+    root = ET.fromstring(payload)
+    stories: list[Story] = []
+
+    for item in root.iter():
+        if item.tag.lower().endswith("item"):
+            title = ""
+            link = ""
+            for child in item:
+                tag = child.tag.lower()
+                if tag.endswith("title") and not title:
+                    title = (child.text or "").strip()
+                elif tag.endswith("link") and not link:
+                    link = (child.text or "").strip()
+
+            title = re.sub(r"\s+", " ", html.unescape(title)).strip()
+            if title and link.startswith(("http://", "https://")):
+                stories.append(Story(title=title, link=link, source=source))
+            if len(stories) >= 5:
+                break
+
+    return stories
+
+async def get_stories(category: str) -> list[Story]:
+    feeds = FEEDS[category]
+    async with aiohttp.ClientSession() as session:
+        for source, url in feeds:
+            try:
+                stories = await fetch_feed(session, source, url)
+                if stories:
+                    return stories
+            except (aiohttp.ClientError, asyncio.TimeoutError, ET.ParseError) as exc:
+                logger.warning("News feed failed: %s | %s", source, exc)
+            except Exception:
+                logger.exception("Unexpected feed error: %s", source)
+    return []
 
 def main_menu() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
-        InlineKeyboardButton(text="📰 Latest News", callback_data="latest"),
-        InlineKeyboardButton(text="🇺🇸 U.S. News", callback_data="us_news"),
+        InlineKeyboardButton(text="📰 Latest News", callback_data="news:latest"),
     )
     builder.row(
-        InlineKeyboardButton(text="🌎 World News", callback_data="world_news"),
+        InlineKeyboardButton(text="🇺🇸 U.S. News", callback_data="news:us"),
     )
     builder.row(
-        InlineKeyboardButton(text="📂 Categories", callback_data="categories"),
-        InlineKeyboardButton(text="ℹ️ About", callback_data="about"),
+        InlineKeyboardButton(text="🌎 World News", callback_data="news:world"),
     )
     return builder.as_markup()
 
-
-def back_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🔙 Main Menu", callback_data="home")]]
+def news_menu(category: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="🔄 Refresh", callback_data=f"news:{category}"),
+        InlineKeyboardButton(text="🏠 Main Menu", callback_data="home"),
     )
+    return builder.as_markup()
 
+def story_menu(stories: list[Story], category: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for index, story in enumerate(stories):
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{index + 1}. {story.title[:55]}",
+                url=story.link,
+            )
+        )
+    builder.row(
+        InlineKeyboardButton(text="🔄 Refresh", callback_data=f"news:{category}"),
+        InlineKeyboardButton(text="🏠 Main Menu", callback_data="home"),
+    )
+    return builder.as_markup()
+
+def format_stories(category: str, stories: list[Story]) -> str:
+    lines = [f"<b>{LABELS[category]}</b>", "", "Recent headlines:"]
+    for index, story in enumerate(stories, start=1):
+        lines.append(f"<b>{index}.</b> {html.escape(story.title)}")
+        lines.append(f"<i>Source: {html.escape(story.source)}</i>")
+    return "\n".join(lines)
+
+async def show_news(target: Message | CallbackQuery, category: str) -> None:
+    if isinstance(target, CallbackQuery):
+        message = target.message
+    else:
+        message = target
+
+    if message is None:
+        return
+
+    stories = await get_stories(category)
+    if stories:
+        text = format_stories(category, stories)
+        markup = story_menu(stories, category)
+    else:
+        text = (
+            f"<b>{LABELS[category]}</b>\n\n"
+            "The news source is temporarily unavailable. "
+            "Please try again in a moment."
+        )
+        markup = news_menu(category)
+
+    try:
+        if isinstance(target, CallbackQuery):
+            await message.edit_text(text, reply_markup=markup)
+        else:
+            await message.answer(text, reply_markup=markup)
+    except TelegramBadRequest:
+        logger.info("Telegram rejected an unchanged message update")
 
 @dp.message(CommandStart())
 async def start_handler(message: Message) -> None:
+    # Telegram Ads may append a start parameter; CommandStart safely accepts it.
     await message.answer(WELCOME, reply_markup=main_menu())
-
 
 @dp.message(Command("help"))
 async def help_handler(message: Message) -> None:
-    await message.answer(
-        "<b>Help</b>\n\nUse the buttons below to browse news categories and learn more about One American News.",
-        reply_markup=main_menu(),
-    )
-
+    await message.answer(HELP, reply_markup=main_menu())
 
 @dp.callback_query(F.data == "home")
 async def home_handler(callback: CallbackQuery) -> None:
-    await callback.message.edit_text(WELCOME, reply_markup=main_menu())
     await callback.answer()
+    if callback.message:
+        await callback.message.edit_text(WELCOME, reply_markup=main_menu())
 
+@dp.callback_query(F.data.startswith("news:"))
+async def news_handler(callback: CallbackQuery) -> None:
+    await callback.answer()
+    category = callback.data.split(":", 1)[1]
+    if category not in FEEDS:
+        if callback.message:
+            await callback.message.edit_text(
+                "That section is unavailable. Please return to the main menu.",
+                reply_markup=main_menu(),
+            )
+        return
+    await show_news(callback, category)
 
-@dp.callback_query(F.data == "latest")
-async def latest_handler(callback: CallbackQuery) -> None:
-    text = (
-        "<b>📰 Latest News</b>\n\n"
-        "This section is ready to display current news summaries once a trusted news feed is connected.\n\n"
-        "<i>No live stories are displayed in this starter version.</i>"
+async def on_startup(bot: Bot) -> None:
+    await bot.set_my_commands(
+        [
+            ("start", "Open the main menu"),
+            ("help", "How to use One American News"),
+        ]
     )
-    await callback.message.edit_text(text, reply_markup=back_menu())
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "us_news")
-async def us_news_handler(callback: CallbackQuery) -> None:
-    text = (
-        "<b>🇺🇸 U.S. News</b>\n\n"
-        "Browse summaries about important events and developments in the United States.\n\n"
-        "Connect a verified news source to populate this section with live stories."
-    )
-    await callback.message.edit_text(text, reply_markup=back_menu())
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "world_news")
-async def world_news_handler(callback: CallbackQuery) -> None:
-    text = (
-        "<b>🌎 World News</b>\n\n"
-        "Explore international news and major global developments in a concise format.\n\n"
-        "Connect a verified news source to populate this section with live stories."
-    )
-    await callback.message.edit_text(text, reply_markup=back_menu())
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "categories")
-async def categories_handler(callback: CallbackQuery) -> None:
-    builder = InlineKeyboardBuilder()
-    for label, value in [
-        ("💻 Technology", "topic_technology"),
-        ("💼 Business", "topic_business"),
-        ("🔬 Science", "topic_science"),
-        ("🏛️ Politics & Public Affairs", "topic_public_affairs"),
-    ]:
-        builder.row(InlineKeyboardButton(text=label, callback_data=value))
-    builder.row(InlineKeyboardButton(text="🔙 Main Menu", callback_data="home"))
-    await callback.message.edit_text(CATEGORIES, reply_markup=builder.as_markup())
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "about")
-async def about_handler(callback: CallbackQuery) -> None:
-    await callback.message.edit_text(ABOUT, reply_markup=back_menu())
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("topic_"))
-async def topic_handler(callback: CallbackQuery) -> None:
-    topic = callback.data.removeprefix("topic_").replace("_", " ").title()
-    text = (
-        f"<b>📌 {topic}</b>\n\n"
-        "This category is ready for curated news summaries. "
-        "Connect your selected news API or RSS sources to publish current stories here."
-    )
-    await callback.message.edit_text(text, reply_markup=back_menu())
-    await callback.answer()
-
+    logger.info("One American News started")
 
 async def main() -> None:
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable is required")
 
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    await bot.delete_webhook(drop_pending_updates=True)
+    await on_startup(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 if __name__ == "__main__":
-    import asyncio
-
     asyncio.run(main())
