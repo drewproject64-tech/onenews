@@ -13,7 +13,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 logging.basicConfig(
@@ -216,8 +216,8 @@ async def news_handler(callback: CallbackQuery) -> None:
 async def on_startup(bot: Bot) -> None:
     await bot.set_my_commands(
         [
-            ("start", "Open the main menu"),
-            ("help", "How to use One American News"),
+            BotCommand(command="start", description="Open the main menu"),
+            BotCommand(command="help", description="How to use One American News"),
         ]
     )
     logger.info("One American News started")
